@@ -1,0 +1,524 @@
+Author: Alex Brown
+Purpose: Code Sample
+About this code: The code shown below is portions of my partitioning and physics systems, which drive the physics in my final project here at Full Sail. 
+Once our levels are loaded, the PartitioningSystem then requests a list of all collidables from our EntityManager. 
+From there, it finds the farthest bounds of all collidables in the world, and builds a "world cell" that every object will fit inside. 
+At this point, the world is then recursively broken down into a tree, with each node having four evenly-sized children other than the leaf nodes, 
+until the cells size fall beneath a desired size. This data structure is known as a quadtree. Collidables are then placed into the cell in which they are fully contained. 
+This allows physics checks to be limited to objects that are within a short distance of each other, preventing many unnecessary checks. 
+
+
+
+///////////////////////////////////////////////////////////////
+//***********************************************************//
+//********************PARTITIONING SYSTEM********************//
+
+///////////////////////////////////////////
+//////////////DATA STRUCTURES//////////////
+
+// 2D collision volume
+struct Extents2D
+{
+	Float2 min;
+	Float2 max;
+	Extents2D(){ min = Float2(0, 0); max = Float2(0, 0); }
+};
+
+// Defines a 2D partitioning cell
+struct Cell2D
+{
+	Float2 size;
+	Extents2D cellExtents;
+	Cell2D* containedCells[4]; // Children
+	Cell2D* parentCell = nullptr;
+	vector<ICollidable*> containedCollidables;
+
+	Cell2D();
+};
+
+// This struct maps a collidable to a cell
+struct Cell2DCollidable
+{
+	Cell2D* cell;
+	ICollidable* collidable;
+	Extents2D collidableExtents;
+};
+
+//////////////////////////////////////////////////////
+// Purpose: 	Using all collidables in the world, this generates a world cell that is large enough
+//		to contain all of the collidables in the world.
+// Return: 	N/A
+// Parameters:	N/A
+//////////////////////////////////////////////////////
+void PartitioningSystem::FindWorldExtents()
+{
+	worldCell = new Cell2D();
+	for (size_t i = 0; i < movingCollidables.size(); i++)
+	{
+		Extents2D colliderExtents;
+		CalculateExtents(movingCollidables[i], colliderExtents);
+
+		worldCell->cellExtents.min.x = min(worldCell->cellExtents.min.x, colliderExtents.min.x);
+		worldCell->cellExtents.min.y = min(worldCell->cellExtents.min.y, colliderExtents.min.y);
+
+		worldCell->cellExtents.max.x = max(worldCell->cellExtents.max.x, colliderExtents.max.x);
+		worldCell->cellExtents.max.y = max(worldCell->cellExtents.max.y, colliderExtents.max.y);
+	}
+
+	for (size_t i = 0; i < staticCollidables.size(); i++)
+	{
+		Extents2D colliderExtents;
+		CalculateExtents(staticCollidables[i], colliderExtents);
+
+		worldCell->cellExtents.min.x = min(worldCell->cellExtents.min.x, colliderExtents.min.x);
+		worldCell->cellExtents.min.y = min(worldCell->cellExtents.min.y, colliderExtents.min.y);
+
+		worldCell->cellExtents.max.x = max(worldCell->cellExtents.max.x, colliderExtents.max.x);
+		worldCell->cellExtents.max.y = max(worldCell->cellExtents.max.y, colliderExtents.max.y);
+	}
+
+	for (size_t i = 0; i < renderedCollidables.size(); i++)
+	{
+		Extents2D colliderExtents;
+		CalculateExtents(renderedCollidables[i], colliderExtents);
+
+		worldCell->cellExtents.min.x = min(worldCell->cellExtents.min.x, colliderExtents.min.x);
+		worldCell->cellExtents.min.y = min(worldCell->cellExtents.min.y, colliderExtents.min.y);
+
+		worldCell->cellExtents.max.x = max(worldCell->cellExtents.max.x, colliderExtents.max.x);
+		worldCell->cellExtents.max.y = max(worldCell->cellExtents.max.y, colliderExtents.max.y);
+	}
+
+	// Define size
+	worldCell->size = worldCell->cellExtents.max - worldCell->cellExtents.min;
+
+	// Expand the world extents by a decent value to help prevent objects being placed in worldCell
+	worldCell->cellExtents.min -= worldCell->size * 0.1f;
+	worldCell->cellExtents.max += worldCell->size * 0.1f;
+
+	// Recalculate size
+	worldCell->size = worldCell->cellExtents.max - worldCell->cellExtents.min;
+
+	Float2 worldCellPosition = (worldCell->cellExtents.min + worldCell->cellExtents.max) * 0.5f;
+
+	// Expand the world extents to ensure all cells are square in shape
+	if (worldCell->size.x < worldCell->size.y)
+	{
+		worldCell->size.x = worldCell->size.y;
+		worldCell->cellExtents.min.x = worldCellPosition.x - worldCell->size.x * 0.6f;
+		worldCell->cellExtents.max.x = worldCellPosition.x + worldCell->size.x * 0.6f;
+	}
+	else
+	{
+		worldCell->size.y = worldCell->size.x;
+		worldCell->cellExtents.min.y = worldCellPosition.y - worldCell->size.y * 0.6f;
+		worldCell->cellExtents.max.y = worldCellPosition.y + worldCell->size.y * 0.6f;
+	}
+}
+
+//////////////////////////////////////////////////////
+// Purpose: 	Starting from the world cell, this recursively creates four children cells for the
+//		passed cell, until a desired size is met, filling out their Cell2D structs.
+// Return: 	N/A
+// Parameters:	Cell2D* _parentCell -- This is the root node of the tree to be created
+//////////////////////////////////////////////////////
+void PartitioningSystem::CreateContainedCells(Cell2D* _parentCell)
+{
+	if (_parentCell->size.x <= nMinCellSize && _parentCell->size.y <= nMinCellSize)
+	{
+		nSmallestX = _parentCell->size.x;
+		nSmallestY = _parentCell->size.y;
+		return;
+	}
+
+	// Bottom-left cell
+	_parentCell->containedCells[0] = new Cell2D();
+	Cell2D* currCell = _parentCell->containedCells[0];
+	currCell->size = _parentCell->size / 2;
+	currCell->parentCell = _parentCell;
+
+	currCell->cellExtents.min = _parentCell->cellExtents.min;
+	currCell->cellExtents.max = currCell->cellExtents.min + currCell->size;
+
+	CreateContainedCells(currCell);
+
+	// Bottom-right cell
+	_parentCell->containedCells[1] = new Cell2D();
+	currCell = _parentCell->containedCells[1];
+	currCell->size = _parentCell->size / 2;
+	currCell->parentCell = _parentCell;
+
+	currCell->cellExtents.min = _parentCell->cellExtents.min;
+	currCell->cellExtents.min.x += currCell->size.x;
+
+	currCell->cellExtents.max = currCell->cellExtents.min + currCell->size;
+
+	CreateContainedCells(currCell);
+
+	// Top-left cell
+	_parentCell->containedCells[2] = new Cell2D();
+	currCell = _parentCell->containedCells[2];
+	currCell->size = _parentCell->size / 2;
+	currCell->parentCell = _parentCell;
+
+	currCell->cellExtents.min = _parentCell->cellExtents.min;
+	currCell->cellExtents.min.y += currCell->size.y;
+
+	currCell->cellExtents.max = currCell->cellExtents.min + currCell->size;
+
+	CreateContainedCells(currCell);
+
+	// Top-right cell
+	_parentCell->containedCells[3] = new Cell2D();
+	currCell = _parentCell->containedCells[3];
+	currCell->size = _parentCell->size / 2;
+	currCell->parentCell = _parentCell;
+
+	currCell->cellExtents.min = _parentCell->cellExtents.min;
+	currCell->cellExtents.min += currCell->size;
+
+	currCell->cellExtents.max = currCell->cellExtents.min + currCell->size;
+
+	CreateContainedCells(currCell);
+}
+
+//////////////////////////////////////////////////////
+// Purpose: 	Calls PlaceCollidable() on each collidable retreieved from the EntityManager
+// Return: 	N/A
+// Parameters:	N/A
+//////////////////////////////////////////////////////
+void PartitioningSystem::PlaceCollidables()
+{
+	for (size_t i = 0; i < movingCollidables.size(); i++)
+		PlaceCollidable(movingCollidables[i], true);
+
+	for (size_t i = 0; i < staticCollidables.size(); i++)
+		PlaceCollidable(staticCollidables[i], false, true);
+
+	for (size_t i = 0; i < renderedCollidables.size(); i++)
+		PlaceCollidable(renderedCollidables[i], true);
+}
+
+//////////////////////////////////////////////////////
+// Purpose: 	Places a collidable into the cell deepest in the tree in which it is fully contained.
+// Return: 	N/A
+// Parameters:	ICollidable* _collidableToPlace -- The collidable to be placed into the proper cell
+//		bool _placeInMovingCell2DVector -- Whether the collidable should be placed into the vector of moving Cell2DCollidables
+//		bool _placeInStaticCell2DVector -- Whether the collidable should be placed into the vector of static Cell2DCollidables
+//		int _index -- Used if the object is being removed from a current Cell2DCollidable vector
+//////////////////////////////////////////////////////
+void PartitioningSystem::PlaceCollidable(ICollidable* _collidableToPlace, bool _placeInMovingCell2DVector, bool _placeInStaticCell2DVector, int _index)
+{
+	Extents2D colliderExtents2D;
+
+	CalculateExtents(_collidableToPlace, colliderExtents2D);
+	PlaceInContainerCell(colliderExtents2D, _collidableToPlace, worldCell, _placeInMovingCell2DVector, _placeInStaticCell2DVector, _index);
+}
+
+//////////////////////////////////////////////////////
+// Purpose: 	Calculates the 2D extents of a passed ICollidable
+// Return: 	N/A
+// Parameters:	ICollidable* _collidable -- The collidable whose extents will be calculated
+// 		Extents2D& _extents (out) -- The Extents2D that contains the passed collidable
+//////////////////////////////////////////////////////
+void PartitioningSystem::CalculateExtents(const ICollidable* _collidable, Extents2D& _extents)
+{
+	Float3 colliderExtentsMin;
+	Float3 colliderExtentsMax;
+
+	COLLIDER_TYPE type = _collidable->GetType();
+	if (type == COLLIDER_TYPE::SPHERE)
+	{
+		const SphereCollider* sphere = (const SphereCollider*)_collidable;
+		colliderExtentsMin = sphere->GetCenter() - Float3(sphere->GetRadius(), 0, (sphere->GetRadius()));
+		colliderExtentsMax = sphere->GetCenter() + Float3(sphere->GetRadius(), 0, (sphere->GetRadius()));
+		colliderExtentsMin += sphere->GetOffset();
+		colliderExtentsMax += sphere->GetOffset();
+
+		colliderExtentsMin.y = 0;
+		colliderExtentsMax.y = 0;
+	}
+	else if (type == COLLIDER_TYPE::AABB)
+	{
+		const AABBCollider* aabb = (const AABBCollider*)_collidable;
+		colliderExtentsMin = aabb->GetCenter() - aabb->GetHalfSize();
+		colliderExtentsMax = aabb->GetCenter() + aabb->GetHalfSize();
+		colliderExtentsMin += aabb->GetOffset();
+		colliderExtentsMax += aabb->GetOffset();
+
+		colliderExtentsMin.y = 0;
+		colliderExtentsMax.y = 0;
+	}
+	else if (type == COLLIDER_TYPE::OBB)
+	{
+		const OBBCollider* obb = (const OBBCollider*)_collidable;
+		Float3 axes[3];
+		obb->GetAxes(axes);
+
+		Float3 tlExtents = obb->GetCenter();
+		tlExtents -= obb->GetHalfSize().x * axes[0];
+		tlExtents += obb->GetHalfSize().z * axes[2];
+		tlExtents += obb->GetOffset().x * axes[0];
+		tlExtents += obb->GetOffset().y * axes[1];
+		tlExtents += obb->GetOffset().z * axes[2];
+
+		Float3 trExtents = obb->GetCenter();
+		trExtents += obb->GetHalfSize().x * axes[0];
+		trExtents += obb->GetHalfSize().z * axes[2];
+		tlExtents += obb->GetOffset().x * axes[0];
+		tlExtents += obb->GetOffset().y * axes[1];
+		tlExtents += obb->GetOffset().z * axes[2];
+
+		Float3 blExtents = obb->GetCenter();
+		blExtents -= obb->GetHalfSize().x * axes[0];
+		blExtents -= obb->GetHalfSize().z * axes[2];
+		tlExtents += obb->GetOffset().x * axes[0];
+		tlExtents += obb->GetOffset().y * axes[1];
+		tlExtents += obb->GetOffset().z * axes[2];
+
+		Float3 brExtents = obb->GetCenter();
+		brExtents += obb->GetHalfSize().x * axes[0];
+		brExtents -= obb->GetHalfSize().z * axes[2];
+		tlExtents += obb->GetOffset().x * axes[0];
+		tlExtents += obb->GetOffset().y * axes[1];
+		tlExtents += obb->GetOffset().z * axes[2];
+
+		float topYVal = max(tlExtents.z, trExtents.z);
+		topYVal = max(topYVal, blExtents.z);
+		topYVal = max(topYVal, brExtents.z);
+
+		float bottomYVal = min(tlExtents.z, trExtents.z);
+		bottomYVal = min(bottomYVal, blExtents.z);
+		bottomYVal = min(bottomYVal, brExtents.z);
+
+		float leftXVal = min(tlExtents.x, trExtents.x);
+		leftXVal = min(leftXVal, blExtents.x);
+		leftXVal = min(leftXVal, brExtents.x);
+
+		float rightXVal = max(tlExtents.x, trExtents.x);
+		rightXVal = max(rightXVal, blExtents.x);
+		rightXVal = max(rightXVal, brExtents.x);
+
+		colliderExtentsMin = Float3(leftXVal, 0, bottomYVal);
+		colliderExtentsMax = Float3(rightXVal, 0, topYVal);
+	}
+	else if (type == COLLIDER_TYPE::CAPSULE)
+	{
+		const CapsuleCollider* capsule = (const CapsuleCollider*)_collidable;
+
+		Float3 axes[3];
+		capsule->GetAxes(axes);
+
+		colliderExtentsMin = capsule->GetCenter() - capsule->GetHalfHeight() * axes[1];
+		colliderExtentsMin += capsule->GetOffset().x * axes[0];
+		colliderExtentsMin += capsule->GetOffset().y * axes[1];
+		colliderExtentsMin += capsule->GetOffset().z * axes[2];
+
+		colliderExtentsMax = capsule->GetCenter() + capsule->GetHalfHeight() * axes[1];
+		colliderExtentsMax += capsule->GetOffset().x * axes[0];
+		colliderExtentsMax += capsule->GetOffset().y * axes[1];
+		colliderExtentsMax += capsule->GetOffset().z * axes[2];
+
+		colliderExtentsMin.y = 0;
+		colliderExtentsMax.y = 0;
+
+		colliderExtentsMin.x -= capsule->GetRadius();
+		colliderExtentsMin.z -= capsule->GetRadius();
+		colliderExtentsMax.x += capsule->GetRadius();
+		colliderExtentsMax.z += capsule->GetRadius();
+
+		float maxX = colliderExtentsMax.x;
+		float minX = colliderExtentsMin.x;
+		float maxZ = colliderExtentsMax.z;
+		float minZ = colliderExtentsMin.z;
+
+		colliderExtentsMax.x = max(maxX, minX);
+		colliderExtentsMin.x = min(maxX, minX);
+		colliderExtentsMax.z = max(maxZ, minZ);
+		colliderExtentsMin.z = min(maxZ, minZ);
+	}
+
+	_extents.min = Float2(colliderExtentsMin.x, colliderExtentsMin.z);
+	_extents.max = Float2(colliderExtentsMax.x, colliderExtentsMax.z);
+}
+
+
+//////////////////////////////////////////////////////
+// Purpose: 	Places a collidable into the cell deepest in the tree in which it is fully contained. If an index is passed, it will also remove the Cell2DCollidable from the desired vector.
+// Return: 	N/A
+// Parameters:	ICollidable* _collidableToPlace -- The collidable to be placed into the proper cell
+//		bool _placeInMovingCell2DVector -- Whether the collidable should be placed into the vector of moving Cell2DCollidables
+//		bool _placeInStaticCell2DVector -- Whether the collidable should be placed into the vector of static Cell2DCollidables
+//		int _index -- Used if the object is being removed from a current Cell2DCollidable vector
+//////////////////////////////////////////////////////
+void PartitioningSystem::PlaceInContainerCell(const Extents2D& _extents, ICollidable* _collidable, Cell2D* _cell, bool _placeInMovingCell2DVector = false, bool _placeInStaticCell2DVector = false, int _index = -1)
+{
+	for (int i = 0; i < 4; i++)
+	{
+		if (!_cell->containedCells[i]) // If this cell has no children, we want to place it in the current cell -- don't check
+			break;
+
+		if (ContainedWithinExtents(_extents, _cell->containedCells[i]->cellExtents))
+		{
+			PlaceInContainerCell(_extents, _collidable, _cell->containedCells[i], _placeInMovingCell2DVector, _placeInStaticCell2DVector, _index);
+			return;
+		}
+	}
+
+	_cell->containedCollidables.push_back(_collidable);
+
+	if (_placeInMovingCell2DVector)
+	{
+		Cell2DCollidable* cell2DCollidable = new Cell2DCollidable;
+		cell2DCollidable->cell = _cell;
+		cell2DCollidable->collidable = _collidable;
+		cell2DCollidable->collidableExtents = _extents;
+
+		if (_index == -1)
+			movingCell2DCollidables.push_back(cell2DCollidable);
+		else
+		{
+			delete movingCell2DCollidables[_index];
+			movingCell2DCollidables[_index] = cell2DCollidable;
+		}
+	}
+	else if (_placeInStaticCell2DVector)
+	{
+		Cell2DCollidable* cell2DCollidable = new Cell2DCollidable;
+		cell2DCollidable->cell = _cell;
+		cell2DCollidable->collidable = _collidable;
+		cell2DCollidable->collidableExtents = _extents;
+
+		if (_index == -1)
+			staticCell2DCollidables.push_back(cell2DCollidable);
+		else
+		{
+			delete staticCell2DCollidables[_index];
+			staticCell2DCollidables[_index] = cell2DCollidable;
+		}
+	}
+}
+
+
+///////////////////////////////////////////////////////////////
+//***********************************************************//
+//********************PHysiCS SYSTEM********************//
+
+//////////////////////////////////////////////////////
+// Purpose: 	Checks collision for all objects within a cell
+// Return: 	N/A
+// Parameters:	N/A
+//////////////////////////////////////////////////////
+void PhysicsSystem::CollisionCheck()
+{
+	vector<PartitioningSystem::Cell2DCollidable*>& cellMoving2DCollidables = mPartitioningSystem->GetMovingCell2DCollidables();
+	for (unsigned int i = 0; i < cellMoving2DCollidables.size(); i++)
+		if (*cellMoving2DCollidables[i]->collidable->hLivingState != LivingState::DEAD && *cellMoving2DCollidables[i]->collidable->hLivingState != LivingState::PERMA_DEAD)
+			CellCollision(cellMoving2DCollidables[i]->cell, cellMoving2DCollidables[i]->collidable);
+}
+
+//////////////////////////////////////////////////////
+// Purpose: 	Checks collision for all objects within a cell, then recurses parents and children
+// Return: 	N/A
+// Parameters:	Cell2D* _cell -- The cell to check all collidables for collision
+//		ICollidable* _collidable -- The collidable to check collision against
+//////////////////////////////////////////////////////
+void PhysicsSystem::CellCollision(Cell2D* _cell, ICollidable* _collidable)
+{
+	Float3 collisionVal;
+	Float3 collidedPlaneNormal;
+
+	// Check all collidables in the current cell
+	for (unsigned int i = 0; i < _cell->containedCollidables.size(); i++)
+	{
+		if (_cell->containedCollidables[i] == _collidable) // Prevents check against self in first iteration
+			continue;
+
+		// If this collidable is inactive, don't check for collision
+		if (*_cell->containedCollidables[i]->hLivingState == LivingState::DEAD)
+			continue;
+
+		if (_collidable->OtherColliderTest(_cell->containedCollidables[i], collisionVal, collidedPlaneNormal))
+		{
+			_collidable->OnCollision(_cell->containedCollidables[i]->hHolder);
+			_cell->containedCollidables[i]->OnCollision(_collidable->hHolder);
+
+			if (!*_collidable->hTrigger && !*_cell->containedCollidables[i]->hTrigger)
+				ResolveCollision(_collidable, _cell->containedCollidables[i], collisionVal, collidedPlaneNormal);
+		}
+	}
+
+	// If it has a parent, check it
+	if (_cell->parentCell)
+		ParentCellCollision(_cell->parentCell, _collidable);
+
+	// If it has children, check them
+	if (_cell->containedCells[0])
+		for (int i = 0; i < 4; i++)
+			ChildrenCellCollision(_cell->containedCells[i], _collidable);
+}
+
+//////////////////////////////////////////////////////
+// Purpose: 	Checks collision for all objects within a cell, then recurses parents
+// Return: 	N/A
+// Parameters:	Cell2D* _cell -- The cell to check all collidables for collision
+//		ICollidable* _collidable -- The collidable to check collision against
+//////////////////////////////////////////////////////
+void PhysicsSystem::ParentCellCollision(Cell2D* _cell, ICollidable* _collidable)
+{
+	Float3 collisionVal;
+	Float3 collidedPlaneNormal;
+
+	for (unsigned int i = 0; i < _cell->containedCollidables.size(); i++)
+	{
+		// If this collidable is inactive, don't check for collision
+		if (*_cell->containedCollidables[i]->hLivingState == LivingState::DEAD)
+			continue;
+
+		if (_collidable->OtherColliderTest(_cell->containedCollidables[i], collisionVal, collidedPlaneNormal))
+		{
+			_collidable->OnCollision(_cell->containedCollidables[i]->hHolder);
+			_cell->containedCollidables[i]->OnCollision(_collidable->hHolder);
+
+			if (!*_collidable->hTrigger && !*_cell->containedCollidables[i]->hTrigger)
+				ResolveCollision(_collidable, _cell->containedCollidables[i], collisionVal, collidedPlaneNormal);
+		}
+	}
+
+	// If it has a parent, check it
+	if (_cell->parentCell)
+		ParentCellCollision(_cell->parentCell, _collidable);
+}
+
+//////////////////////////////////////////////////////
+// Purpose: 	Checks collision for all objects within a cell, then recurses parents
+// Return: 	N/A
+// Parameters:	Cell2D* _cell -- The cell to check all collidables for collision
+//		ICollidable* _collidable -- The collidable to check collision against
+//////////////////////////////////////////////////////
+void PhysicsSystem::ChildrenCellCollision(Cell2D* _cell, ICollidable* _collidable)
+{
+	Float3 collisionVal;
+	Float3 collidedPlaneNormal;
+
+	for (unsigned int i = 0; i < _cell->containedCollidables.size(); i++)
+	{
+		// If this collidable is inactive, don't check for collision
+		if (*_cell->containedCollidables[i]->hLivingState == LivingState::DEAD)
+			continue;
+
+		if (_collidable->OtherColliderTest(_cell->containedCollidables[i], collisionVal, collidedPlaneNormal))
+		{
+			_collidable->OnCollision(_cell->containedCollidables[i]->hHolder);
+			_cell->containedCollidables[i]->OnCollision(_collidable->hHolder);
+
+			if (!*_collidable->hTrigger && !*_cell->containedCollidables[i]->hTrigger)
+				ResolveCollision(_collidable, _cell->containedCollidables[i], collisionVal, collidedPlaneNormal);
+		}
+	}
+
+	// If it has children, check them
+	if (_cell->containedCells[0])
+		for (int i = 0; i < 4; i++)
+			ChildrenCellCollision(_cell->containedCells[i], _collidable);
+}
